@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, AutoModel
 
 import train as train_utils
+from data_checks import check_train_val_split, embedding_fingerprint
 from dataset import ResizeAndPad
 from task_config import ClassificationTask, REGRESSION_TARGETS, get_classification_tasks, map_grade
 
@@ -39,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default="dy_dinov3_vits16_3grade_head_v1")
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
     parser.add_argument("--model-name", type=str, default="facebook/dinov3-vits16-pretrain-lvd1689m")
+    parser.add_argument("--model-revision", type=str, default=None, help="Pin a Hugging Face commit for reproducible features.")
     parser.add_argument("--hf-token", type=str, default="")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -196,7 +198,9 @@ def pooled_features(outputs: Any) -> torch.Tensor:
     raise TypeError("Could not find pooled DINOv3 features in model output.")
 
 
-def cache_matches(payload: dict[str, Any], args: argparse.Namespace, csv_path: Path) -> bool:
+def cache_matches(
+    payload: dict[str, Any], args: argparse.Namespace, csv_path: Path, fingerprint: str
+) -> bool:
     meta = payload.get("meta", {})
     if meta.get("model_name") != args.model_name:
         return False
@@ -206,9 +210,7 @@ def cache_matches(payload: dict[str, Any], args: argparse.Namespace, csv_path: P
         return False
     if str(meta.get("csv_path")) != str(csv_path.resolve()):
         return False
-    if int(meta.get("rows", -1)) != len(pd.read_csv(csv_path)):
-        return False
-    return True
+    return meta.get("fingerprint") == fingerprint
 
 
 def extract_or_load_embeddings(
@@ -221,9 +223,16 @@ def extract_or_load_embeddings(
     encoder: torch.nn.Module,
     device: torch.device,
 ) -> dict[str, Any]:
+    resolved_revision = getattr(encoder.config, "_commit_hash", None) or args.model_revision
+    if resolved_revision is None:
+        logger.warning("Encoder revision unavailable: embedding cache will be rebuilt. Pin --model-revision to reuse it.")
+    fingerprint = embedding_fingerprint(
+        csv_path, regression_stats, processor.to_dict(),
+        str(resolved_revision or "unresolved"), args.image_size,
+    )
     if cache_path.exists() and not args.force_embeddings:
         payload = torch.load(cache_path, map_location="cpu")
-        if isinstance(payload, dict) and cache_matches(payload, args, csv_path):
+        if resolved_revision is not None and isinstance(payload, dict) and cache_matches(payload, args, csv_path, fingerprint):
             logger.info("loaded embedding cache: %s", cache_path)
             return payload
         logger.info("embedding cache mismatch, rebuilding: %s", cache_path)
@@ -273,6 +282,8 @@ def extract_or_load_embeddings(
             "grade_scheme": args.grade_scheme,
             "csv_path": str(csv_path.resolve()),
             "rows": len(dataset),
+            "fingerprint": fingerprint,
+            "model_revision": resolved_revision,
         },
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -483,6 +494,9 @@ def train(args: argparse.Namespace) -> None:
     if not args.val_csv.exists():
         raise FileNotFoundError(f"Missing val CSV: {args.val_csv}")
 
+    split_summary = check_train_val_split(args.train_csv, args.val_csv)
+    logger.info("subject-disjoint train/val split: %s", split_summary)
+
     train_utils.set_seed(args.seed)
     checkpoint_dir = resolve_checkpoint_dir(args)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -517,12 +531,14 @@ def train(args: argparse.Namespace) -> None:
 
     processor = AutoImageProcessor.from_pretrained(
         args.model_name,
+        revision=args.model_revision,
         token=token,
         local_files_only=args.local_files_only,
         trust_remote_code=args.trust_remote_code,
     )
     encoder = AutoModel.from_pretrained(
         args.model_name,
+        revision=args.model_revision,
         token=token,
         local_files_only=args.local_files_only,
         trust_remote_code=args.trust_remote_code,

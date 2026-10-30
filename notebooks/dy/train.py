@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
+from data_checks import check_train_val_split
 from dataset import ForeheadGlabellaDataset, get_transforms
 from model import DEFAULT_LOCAL_RESNET50, get_model
 from task_config import CLASSIFICATION_TASKS, REGRESSION_TARGETS, get_classification_tasks, map_grade
@@ -116,8 +117,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weights",
         choices=["local_or_none", "local", "torchvision", "none"],
-        default="local_or_none",
-        help="ResNet-50 initialization. torchvision may download if not cached.",
+        default="local",
+        help="ResNet-50 initialization. Default requires local pretrained weights; torchvision may download.",
     )
     parser.add_argument("--pretrained-path", type=Path, default=DEFAULT_LOCAL_RESNET50)
     parser.add_argument("--freeze-backbone", action="store_true")
@@ -734,6 +735,9 @@ def train(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Missing train CSV: {args.train_csv}")
     if not args.val_csv.exists():
         raise FileNotFoundError(f"Missing val CSV: {args.val_csv}")
+
+    split_summary = check_train_val_split(args.train_csv, args.val_csv)
+    logger.info("subject-disjoint train/val split: %s", split_summary)
 
     set_seed(args.seed)
     checkpoint_dir = resolve_checkpoint_dir(args)

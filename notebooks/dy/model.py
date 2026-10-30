@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import torch
@@ -34,7 +35,7 @@ def _clean_state_dict(payload: object) -> dict[str, torch.Tensor]:
 
 
 def build_resnet50_backbone(
-    weights: str = "local_or_none",
+    weights: str = "local",
     pretrained_path: Path | str | None = DEFAULT_LOCAL_RESNET50,
 ) -> models.ResNet:
     """Create a ResNet-50 backbone and load optional pretrained weights."""
@@ -47,9 +48,16 @@ def build_resnet50_backbone(
         path = Path(pretrained_path) if pretrained_path else DEFAULT_LOCAL_RESNET50
         if path.exists():
             payload = torch.load(path, map_location="cpu")
-            backbone.load_state_dict(_clean_state_dict(payload), strict=False)
+            backbone.load_state_dict(_clean_state_dict(payload), strict=True)
         elif weights == "local":
             raise FileNotFoundError(f"Missing pretrained ResNet-50 weights: {path}")
+        else:
+            warnings.warn(
+                f"No pretrained weights at {path}; starting ResNet-50 from random weights. "
+                "Use weights='local' to require pretrained weights.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return backbone
 
     if weights == "torchvision":
@@ -65,7 +73,7 @@ class ResNet50MultiTask(nn.Module):
 
     def __init__(
         self,
-        weights: str = "local_or_none",
+        weights: str = "local",
         pretrained_path: Path | str | None = DEFAULT_LOCAL_RESNET50,
         projection_dim: int = 512,
         dropout_p: float = 0.30,
@@ -140,7 +148,7 @@ class ResNet50MultiTask(nn.Module):
 
 
 def get_model(
-    weights: str = "local_or_none",
+    weights: str = "local",
     pretrained_path: Path | str | None = DEFAULT_LOCAL_RESNET50,
     projection_dim: int = 512,
     dropout_p: float = 0.30,
