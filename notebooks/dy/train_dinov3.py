@@ -1,4 +1,10 @@
-"""Train multitask heads on frozen DINOv3 embeddings for forehead/glabella."""
+"""Train multitask heads on frozen DINOv3 embeddings for forehead/glabella.
+
+v2 options (defaults reproduce v1):
+  --pooling pooler|cls|mean|cls_mean   which frozen feature feeds the head
+  --embedding-cache-dir DIR            share embedding caches across runs/seeds
+  --test-csv PATH                      subject-disjoint test set, scored once with best.pth
+"""
 
 from __future__ import annotations
 
@@ -33,7 +39,7 @@ DEFAULT_VAL_CSV = PROJECT_ROOT / "data" / "processed" / "dy_forehead_glabella_va
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-csv", type=Path, default=DEFAULT_TRAIN_CSV)
     parser.add_argument("--val-csv", type=Path, default=DEFAULT_VAL_CSV)
@@ -72,7 +78,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-embeddings", action="store_true")
     parser.add_argument("--max-train-rows", type=int, default=0)
     parser.add_argument("--max-val-rows", type=int, default=0)
-    return parser.parse_args()
+    parser.add_argument("--pooling", choices=["pooler", "cls", "mean", "cls_mean"], default="pooler",
+                        help="pooler/cls: CLS token; mean: average patch token; cls_mean: both concatenated")
+    parser.add_argument("--embedding-cache-dir", type=Path, default=None,
+                        help="shared cache folder keyed by CSV, model, size and pooling (reused across seeds)")
+    parser.add_argument("--test-csv", type=Path, default=None,
+                        help="subject-disjoint test CSV; evaluated once with the best checkpoint")
+    return parser.parse_args(argv)
 
 
 def resolve_token(explicit_token: str) -> str | None:
@@ -183,19 +195,41 @@ def encoder_forward(encoder: torch.nn.Module, pixel_values: torch.Tensor) -> Any
         return encoder(pixel_values=pixel_values)
 
 
-def pooled_features(outputs: Any) -> torch.Tensor:
-    pooler_output = getattr(outputs, "pooler_output", None)
-    if pooler_output is not None:
-        return pooler_output
+def pooled_features(outputs: Any, pooling: str = "pooler", num_registers: int = 0) -> torch.Tensor:
+    """Frozen image feature.
+
+    pooler: model pooler output (CLS after final norm for DINOv3), v1 behaviour
+    cls:    CLS token of last_hidden_state
+    mean:   mean of patch tokens (register tokens excluded)
+    cls_mean: L2-normalised CLS and patch mean, concatenated
+    """
+    if pooling == "pooler":
+        pooler_output = getattr(outputs, "pooler_output", None)
+        if pooler_output is not None:
+            return pooler_output
     last_hidden_state = getattr(outputs, "last_hidden_state", None)
-    if last_hidden_state is not None:
-        return last_hidden_state[:, 0]
-    if isinstance(outputs, (tuple, list)) and outputs:
-        first = outputs[0]
-        if first.ndim == 3:
-            return first[:, 0]
-        return first
-    raise TypeError("Could not find pooled DINOv3 features in model output.")
+    if last_hidden_state is None and isinstance(outputs, (tuple, list)) and outputs:
+        last_hidden_state = outputs[0]
+    if last_hidden_state is None:
+        raise TypeError("Could not find pooled DINOv3 features in model output.")
+    if last_hidden_state.ndim != 3:
+        return last_hidden_state
+    cls = last_hidden_state[:, 0]
+    if pooling in ("pooler", "cls"):
+        return cls
+    patches = last_hidden_state[:, 1 + num_registers:].mean(dim=1)
+    if pooling == "mean":
+        return patches
+    if pooling == "cls_mean":
+        return torch.cat([nn.functional.normalize(cls, dim=-1), nn.functional.normalize(patches, dim=-1)], dim=-1)
+    raise ValueError(f"Unknown pooling {pooling}")
+
+
+def embedding_cache_path(args: argparse.Namespace, csv_path: Path, default: Path) -> Path:
+    if args.embedding_cache_dir is None:
+        return default
+    slug = args.model_name.replace("/", "--")
+    return Path(args.embedding_cache_dir) / f"{csv_path.stem}__{slug}__{args.image_size}__{args.pooling}.pt"
 
 
 def cache_matches(
@@ -207,6 +241,8 @@ def cache_matches(
     if int(meta.get("image_size", -1)) != int(args.image_size):
         return False
     if meta.get("grade_scheme") != args.grade_scheme:
+        return False
+    if meta.get("pooling", "pooler") != getattr(args, "pooling", "pooler"):
         return False
     if str(meta.get("csv_path")) != str(csv_path.resolve()):
         return False
@@ -264,7 +300,9 @@ def extract_or_load_embeddings(
         for batch in tqdm(loader, desc=desc):
             pixel_values = preprocess_images(processor, batch["images"]).to(device)
             outputs = encoder_forward(encoder, pixel_values)
-            features.append(pooled_features(outputs).detach().cpu().float())
+            features.append(pooled_features(outputs, args.pooling,
+                                            int(getattr(encoder.config, "num_register_tokens", 0) or 0)
+                                            ).detach().cpu().float())
             cls_targets.append(batch["cls_targets"])
             reg_targets.append(batch["reg_targets"])
             reg_masks.append(batch["reg_mask"])
@@ -280,6 +318,7 @@ def extract_or_load_embeddings(
             "model_name": args.model_name,
             "image_size": args.image_size,
             "grade_scheme": args.grade_scheme,
+            "pooling": args.pooling,
             "csv_path": str(csv_path.resolve()),
             "rows": len(dataset),
             "fingerprint": fingerprint,
@@ -496,6 +535,11 @@ def train(args: argparse.Namespace) -> None:
 
     split_summary = check_train_val_split(args.train_csv, args.val_csv)
     logger.info("subject-disjoint train/val split: %s", split_summary)
+    if args.test_csv is not None:
+        if not args.test_csv.exists():
+            raise FileNotFoundError(f"Missing test CSV: {args.test_csv}")
+        logger.info("subject-disjoint train/test split: %s", check_train_val_split(args.train_csv, args.test_csv))
+        logger.info("subject-disjoint val/test split: %s", check_train_val_split(args.val_csv, args.test_csv))
 
     train_utils.set_seed(args.seed)
     checkpoint_dir = resolve_checkpoint_dir(args)
@@ -546,7 +590,7 @@ def train(args: argparse.Namespace) -> None:
 
     train_payload = extract_or_load_embeddings(
         csv_path=args.train_csv,
-        cache_path=checkpoint_dir / "train_embeddings.pt",
+        cache_path=embedding_cache_path(args, args.train_csv, checkpoint_dir / "train_embeddings.pt"),
         args=args,
         regression_stats=regression_stats,
         tasks=tasks,
@@ -556,7 +600,7 @@ def train(args: argparse.Namespace) -> None:
     )
     val_payload = extract_or_load_embeddings(
         csv_path=args.val_csv,
-        cache_path=checkpoint_dir / "val_embeddings.pt",
+        cache_path=embedding_cache_path(args, args.val_csv, checkpoint_dir / "val_embeddings.pt"),
         args=args,
         regression_stats=regression_stats,
         tasks=tasks,
@@ -564,6 +608,19 @@ def train(args: argparse.Namespace) -> None:
         encoder=encoder,
         device=device,
     )
+
+    test_payload = None
+    if args.test_csv is not None:
+        test_payload = extract_or_load_embeddings(
+            csv_path=args.test_csv,
+            cache_path=embedding_cache_path(args, args.test_csv, checkpoint_dir / "test_embeddings.pt"),
+            args=args,
+            regression_stats=regression_stats,
+            tasks=tasks,
+            processor=processor,
+            encoder=encoder,
+            device=device,
+        )
 
     del encoder
     if torch.cuda.is_available():
@@ -704,12 +761,26 @@ def train(args: argparse.Namespace) -> None:
         "best_checkpoint": str(best_path),
         "history_path": str(history_path),
         "embedding_cache": {
-            "train": str(checkpoint_dir / "train_embeddings.pt"),
-            "val": str(checkpoint_dir / "val_embeddings.pt"),
+            "train": str(embedding_cache_path(args, args.train_csv, checkpoint_dir / "train_embeddings.pt")),
+            "val": str(embedding_cache_path(args, args.val_csv, checkpoint_dir / "val_embeddings.pt")),
         },
         "best_score": best_score,
         "best_epoch": best_epoch + 1 if best_epoch >= 0 else 0,
+        "pooling": args.pooling,
+        "seed": args.seed,
+        "feature_dim": feature_dim,
     }
+    if test_payload is not None:
+        best = torch.load(best_path, map_location=device, weights_only=False)
+        model.load_state_dict(best["model_state_dict"])
+        test_loader = DataLoader(EmbeddingDataset(test_payload), batch_size=args.head_batch_size,
+                                 shuffle=False, num_workers=0)
+        test_metrics = run_embedding_epoch(model, test_loader, device, class_weights, regression_stats, args, None)
+        test_metrics = {key.replace("val_", "test_", 1): value for key, value in test_metrics.items()}
+        summary["test_csv"] = str(args.test_csv)
+        summary["test_metrics"] = test_metrics
+        summary["test_mean_macro_f1"] = test_metrics.get("test_mean_macro_f1")
+        logger.info("test (best.pth, scored once): macro_f1=%.4f", summary["test_mean_macro_f1"])
     summary_path = checkpoint_dir / "training_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
